@@ -1,12 +1,12 @@
 import { Hono } from "hono";
-import { decrypt } from "../../src/shared/encryption";
-import { verifyJwt } from "../../src/shared/jwt";
 import {
-	EDIT_COOKIE_TTL,
 	buildEditCookieAttributes,
+	EDIT_COOKIE_TTL,
 	signEditCookie,
 	verifyEditCookie,
 } from "../../src/shared/edit-cookie";
+import { decrypt } from "../../src/shared/encryption";
+import { verifyJwt } from "../../src/shared/jwt";
 import { authMiddleware } from "../shared/auth-middleware";
 
 interface GistMeta {
@@ -234,8 +234,7 @@ gistRoutes.get("/:gist_id/raw", async (c) => {
 gistRoutes.get("/:gist_id/can-edit", async (c) => {
 	const gistId = c.req.param("gist_id");
 
-	const sessionCookie =
-		c.req.header("cookie")?.match(/__session=([^;]+)/)?.[1];
+	const sessionCookie = c.req.header("cookie")?.match(/__session=([^;]+)/)?.[1];
 	let isOwner = false;
 	if (sessionCookie) {
 		try {
@@ -245,9 +244,7 @@ gistRoutes.get("/:gist_id/can-edit", async (c) => {
 				audience: "gist.party",
 				issuer: "gist.party",
 			});
-			const stub = c.env.GIST_ROOM.get(
-				c.env.GIST_ROOM.idFromName(gistId),
-			);
+			const stub = c.env.GIST_ROOM.get(c.env.GIST_ROOM.idFromName(gistId));
 			const metaRes = await stub.fetch(new Request("https://do/meta"));
 			const meta = (await metaRes.json()) as GistMeta;
 			isOwner = meta.ownerUserId === claims.userId;
