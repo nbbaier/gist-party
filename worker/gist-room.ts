@@ -1,313 +1,723 @@
-import { YServer } from "y-partyserver";
 import type { Connection, ConnectionContext } from "partyserver";
+import { YServer } from "y-partyserver";
 import * as Y from "yjs";
+import { decrypt } from "../src/shared/encryption";
+import { verifyEditCookie } from "../src/shared/edit-cookie";
 import {
-  MessageTypeRequestMarkdown,
-  MessageTypeNeedsInit,
-  MessageTypeCanonicalMarkdown,
-  MessageTypePushLocal,
-  MessageTypeDiscardLocal,
-  type CustomMessage,
-  type CanonicalMarkdownPayload,
-  encodeMessage,
-  decodeMessage,
+	type CanonicalMarkdownPayload,
+	type CustomMessage,
+	type SyncState,
+	decodeMessage,
+	encodeMessage,
+	MessageTypeCanonicalMarkdown,
+	MessageTypeDiscardLocal,
+	MessageTypeErrorRetrying,
+	MessageTypeNeedsInit,
+	MessageTypePushLocal,
+	MessageTypeReloadRemote,
+	MessageTypeRemoteChanged,
+	MessageTypeRequestMarkdown,
+	MessageTypeSyncStatus,
 } from "./shared/messages";
 
-// Pending markdown request tracking
 interface PendingMarkdownRequest {
-  resolve: (markdown: string | null) => void;
-  timeout: ReturnType<typeof setTimeout>;
+	resolve: (markdown: string | null) => void;
+	timeout: ReturnType<typeof setTimeout>;
 }
 
-export class GistRoom extends YServer {
-  // Enable hibernation for cost efficiency
-  static options = {
-    hibernate: true,
-  };
+interface WorkerEnv {
+	GIST_ROOM: DurableObjectNamespace;
+	SESSION_KV: KVNamespace;
+	GITHUB_CLIENT_ID: string;
+	GITHUB_CLIENT_SECRET: string;
+	JWT_SECRET: string;
+	ENCRYPTION_KEY_V1: string;
+}
 
-  // Configure debounced save behavior
-  static callbackOptions = {
-    debounceWait: 30000, // 30 seconds
-    debounceMaxWait: 60000, // Max 60 seconds
-  };
+const STALE_THRESHOLD_MS = 5 * 60 * 1000;
+const MAX_RETRY_BACKOFF_MS = 300_000;
 
-  // Connection and rate limits
-  static MAX_CONNECTIONS = 50; // Max concurrent connections per room
-  static MAX_MESSAGE_SIZE = 2 * 1024 * 1024; // 2MB max message size
-  static MESSAGE_RATE_WINDOW = 60000; // 1 minute window
-  static MAX_MESSAGES_PER_WINDOW = 100; // Max messages per connection per minute
+export class GistRoom extends YServer<WorkerEnv> {
+	static options = {
+		hibernate: true,
+	};
 
-  // In-memory state (cleared on hibernation)
-  private pendingMarkdownRequests = new Map<string, PendingMarkdownRequest>();
-  private needsInit = false;
-  private messageCounts = new Map<string, number[]>(); // connectionId -> timestamps
+	static callbackOptions = {
+		debounceWait: 30000,
+		debounceMaxWait: 60000,
+	};
 
-  // ============================================================================
-  // Lifecycle Methods
-  // ============================================================================
+	static MAX_CONNECTIONS = 50;
+	static MAX_MESSAGE_SIZE = 2 * 1024 * 1024;
+	static MESSAGE_RATE_WINDOW = 60000;
+	static MAX_MESSAGES_PER_WINDOW = 100;
 
-  /**
-   * Called once when the DO starts (after onLoad completes)
-   */
-  async onStart(): Promise<void> {
-    console.log(`[GistRoom ${this.name}] Server started`);
-  }
+	private pendingMarkdownRequests = new Map<string, PendingMarkdownRequest>();
+	private needsInit = false;
+	private messageCounts = new Map<string, number[]>();
+	private connectionCapabilities = new Map<string, { canEdit: boolean }>();
 
-  /**
-   * Called once on first client connect - load persisted state
-   */
-  async onLoad(): Promise<void> {
-    console.log(`[GistRoom ${this.name}] Loading...`);
+	private ownerToken: string | null = null;
+	private syncState: SyncState = "saved";
+	private retryAttempt = 0;
+	private retryTimeout: ReturnType<typeof setTimeout> | null = null;
+	private autoSyncPaused = false;
+	private snapshotUpdatedAt: string | null = null;
 
-    // Clear any stale in-memory state from previous hibernation
-    this.pendingMarkdownRequests.clear();
-    this.messageCounts.clear();
-    this.needsInit = false;
+	// ============================================================================
+	// Lifecycle Methods
+	// ============================================================================
 
-    // Ensure database schema exists
-    this.ensureSchema();
+	async onStart(): Promise<void> {
+		console.log(`[GistRoom ${this.name}] Server started`);
+	}
 
-    // Load Yjs snapshot if exists
-    const snapshot = this.loadSnapshot();
-    if (snapshot) {
-      console.log(`[GistRoom ${this.name}] Restored from snapshot`);
-      Y.applyUpdate(this.document, snapshot);
-      return;
-    }
+	async onLoad(): Promise<void> {
+		console.log(`[GistRoom ${this.name}] Loading...`);
 
-    // Check if room is initialized but has no snapshot
-    const initialized = this.getMeta("initialized");
-    if (initialized === "true") {
-      console.log(`[GistRoom ${this.name}] Initialized but no snapshot - needs init content`);
-      this.needsInit = true;
-    }
-  }
+		this.pendingMarkdownRequests.clear();
+		this.messageCounts.clear();
+		this.connectionCapabilities.clear();
+		this.needsInit = false;
+		this.ownerToken = null;
+		this.syncState = "saved";
+		this.retryAttempt = 0;
+		this.retryTimeout = null;
+		this.autoSyncPaused = false;
+		this.snapshotUpdatedAt = null;
 
-  /**
-   * Called periodically after document edits (debounced)
-   */
-  async onSave(): Promise<void> {
-    console.log(`[GistRoom ${this.name}] Saving snapshot...`);
+		this.ensureSchema();
 
-    // Save Yjs state as snapshot
-    const snapshot = Y.encodeStateAsUpdate(this.document);
-    this.saveSnapshot(snapshot);
+		const snapshot = this.loadSnapshot();
+		if (snapshot) {
+			console.log(`[GistRoom ${this.name}] Restored from snapshot`);
+			Y.applyUpdate(this.document, snapshot.data);
+			this.snapshotUpdatedAt = snapshot.updatedAt;
+			return;
+		}
 
-    // Request canonical markdown from a client
-    await this.requestCanonicalMarkdown();
-  }
+		const initialized = this.getMeta("initialized");
+		if (initialized === "true") {
+			console.log(
+				`[GistRoom ${this.name}] Initialized but no snapshot - needs init content`,
+			);
+			this.needsInit = true;
+		}
+	}
 
-  /**
-   * Called when a new WebSocket connection is established
-   */
-  async onConnect(connection: Connection, _ctx: ConnectionContext): Promise<void> {
-    // Enforce connection count limit
-    const currentConnections = Array.from(this.getConnections()).length;
-    if (currentConnections >= GistRoom.MAX_CONNECTIONS) {
-      console.log(`[GistRoom ${this.name}] Rejecting connection - max connections (${GistRoom.MAX_CONNECTIONS}) reached`);
-      connection.close(4005, "Room is at capacity");
-      return;
-    }
+	async onSave(): Promise<void> {
+		console.log(`[GistRoom ${this.name}] Saving snapshot...`);
 
-    console.log(`[GistRoom ${this.name}] Connection ${connection.id} joined (${currentConnections + 1}/${GistRoom.MAX_CONNECTIONS})`);
+		const snapshot = Y.encodeStateAsUpdate(this.document);
+		this.saveSnapshot(snapshot);
 
-    // Check if room is initialized
-    const initialized = this.getMeta("initialized");
-    if (initialized !== "true") {
-      console.log(`[GistRoom ${this.name}] Rejecting connection - room not initialized`);
-      connection.close(4004, "Room not initialized");
-      return;
-    }
+		const markdown = await this.requestCanonicalMarkdown();
 
-    // TODO: Verify JWT session cookie (stub until Track 1A delivers)
-    // const user = await verifyJWT(cookie, secret);
-    // connection.setState({ user });
+		if (markdown && this.ownerToken && !this.autoSyncPaused) {
+			await this.syncToGitHub(markdown);
+		}
+	}
 
-    // Initialize message tracking for this connection
-    this.messageCounts.set(connection.id, []);
+	async onConnect(
+		connection: Connection,
+		ctx: ConnectionContext,
+	): Promise<void> {
+		const currentConnections = Array.from(this.getConnections()).length;
+		if (currentConnections >= GistRoom.MAX_CONNECTIONS) {
+			console.log(
+				`[GistRoom ${this.name}] Rejecting connection - max connections (${GistRoom.MAX_CONNECTIONS}) reached`,
+			);
+			connection.close(4005, "Room is at capacity");
+			return;
+		}
 
-    // If room needs init content, send needs-init to first client
-    if (this.needsInit) {
-      const gistId = this.getMeta("gistId");
-      const filename = this.getMeta("filename");
+		console.log(
+			`[GistRoom ${this.name}] Connection ${connection.id} joined (${currentConnections + 1}/${GistRoom.MAX_CONNECTIONS})`,
+		);
 
-      if (gistId && filename) {
-        const message: CustomMessage = {
-          type: MessageTypeNeedsInit,
-          payload: { gistId, filename },
-        };
-        this.sendCustomMessage(connection, encodeMessage(message));
-        this.needsInit = false; // Only send to first client
-        console.log(`[GistRoom ${this.name}] Sent needs-init to ${connection.id}`);
-      }
-    }
-  }
+		const initialized = this.getMeta("initialized");
+		if (initialized !== "true") {
+			console.log(
+				`[GistRoom ${this.name}] Rejecting connection - room not initialized`,
+			);
+			connection.close(4004, "Room not initialized");
+			return;
+		}
 
-  /**
-   * Called when a connection closes
-   */
-  onClose(
-    connection: Connection,
-    code: number,
-    reason: string,
-    _wasClean: boolean
-  ): void {
-    console.log(
-      `[GistRoom ${this.name}] Connection ${connection.id} left (code: ${code}, reason: ${reason})`
-    );
-    
-    // Clean up message tracking for this connection
-    this.messageCounts.delete(connection.id);
-  }
+		this.messageCounts.set(connection.id, []);
 
-  /**
-   * Called when a message is received from a connection
-   * Enforces message size and rate limits
-   */
-  async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
-    // Check message size (convert to bytes for size check)
-    const messageBytes = typeof message === 'string' 
-      ? new TextEncoder().encode(message).length 
-      : message.byteLength;
-    
-    if (messageBytes > GistRoom.MAX_MESSAGE_SIZE) {
-      console.log(`[GistRoom ${this.name}] Message from ${connection.id} exceeds size limit (${messageBytes} > ${GistRoom.MAX_MESSAGE_SIZE})`);
-      connection.close(4009, "Message too large");
-      return;
-    }
+		const canEdit = await this.checkEditCapability(ctx);
+		this.connectionCapabilities.set(connection.id, { canEdit });
 
-    // Check rate limit
-    const now = Date.now();
-    const timestamps = this.messageCounts.get(connection.id) || [];
-    
-    // Remove timestamps outside the window
-    const windowStart = now - GistRoom.MESSAGE_RATE_WINDOW;
-    const recentTimestamps = timestamps.filter(ts => ts > windowStart);
-    
-    if (recentTimestamps.length >= GistRoom.MAX_MESSAGES_PER_WINDOW) {
-      console.log(`[GistRoom ${this.name}] Rate limit exceeded for ${connection.id}`);
-      connection.close(4008, "Rate limit exceeded");
-      return;
-    }
-    
-    // Record this message
-    recentTimestamps.push(now);
-    this.messageCounts.set(connection.id, recentTimestamps);
+		if (this.needsInit) {
+			const gistId = this.getMeta("gistId");
+			const filename = this.getMeta("filename");
 
-    // Process the message via parent class (handles Yjs updates)
-    await super.onMessage(connection, message);
-  }
+			if (gistId && filename) {
+				const message: CustomMessage = {
+					type: MessageTypeNeedsInit,
+					payload: { gistId, filename },
+				};
+				this.sendCustomMessage(connection, encodeMessage(message));
+				this.needsInit = false;
+				console.log(
+					`[GistRoom ${this.name}] Sent needs-init to ${connection.id}`,
+				);
+			}
+		}
 
-  /**
-   * Handle custom messages from clients (non-Yjs messages)
-   */
-  onCustomMessage(connection: Connection, message: string): void {
-    try {
-      const parsed = decodeMessage(message);
+		await this.tryLoadOwnerToken(connection);
+		await this.checkStaleness();
+	}
 
-      switch (parsed.type) {
-        case MessageTypeCanonicalMarkdown:
-          this.handleCanonicalMarkdown(
-            connection,
-            parsed.payload as CanonicalMarkdownPayload
-          );
-          break;
+	onClose(
+		connection: Connection,
+		code: number,
+		reason: string,
+		_wasClean: boolean,
+	): void {
+		console.log(
+			`[GistRoom ${this.name}] Connection ${connection.id} left (code: ${code}, reason: ${reason})`,
+		);
 
-        case MessageTypePushLocal:
-        case MessageTypeDiscardLocal:
-          // Handled in Phase 4A (conflict resolution)
-          console.log(`[GistRoom ${this.name}] Received ${parsed.type} (not yet implemented)`);
-          break;
+		this.messageCounts.delete(connection.id);
+		this.connectionCapabilities.delete(connection.id);
 
-        default:
-          console.log(`[GistRoom ${this.name}] Unknown message type: ${parsed.type}`);
-      }
-    } catch (error) {
-      console.error(`[GistRoom ${this.name}] Error handling custom message:`, error);
-    }
-  }
+		if (this.ownerToken && this.isOwnerConnection(connection)) {
+			const hasOtherOwnerConnection = this.findOwnerConnection(connection.id) !== null;
+			if (!hasOtherOwnerConnection) {
+				this.ownerToken = null;
+				const pendingSync = this.getMeta("pendingSync");
+				if (pendingSync === "true") {
+					this.setMeta("pendingSince", new Date().toISOString());
+				}
+				console.log(
+					`[GistRoom ${this.name}] Owner disconnected, cleared token`,
+				);
+			}
+		}
+	}
 
-  /**
-   * Check if a connection is read-only
-   * Stub: returns false for all authenticated connections (Phase 1)
-   * In Phase 3B, this will check edit capability cookie
-   */
-  isReadOnly(_connection: Connection): boolean {
-    // TODO: Check edit capability cookie (Track 3B)
-    // For Phase 1, all authenticated connections can edit
-    return false;
-  }
+	async onMessage(
+		connection: Connection,
+		message: string | ArrayBuffer,
+	): Promise<void> {
+		const messageBytes =
+			typeof message === "string"
+				? new TextEncoder().encode(message).length
+				: message.byteLength;
 
-  // ============================================================================
-  // HTTP Request Handler (for DO RPC)
-  // ============================================================================
+		if (messageBytes > GistRoom.MAX_MESSAGE_SIZE) {
+			console.log(
+				`[GistRoom ${this.name}] Message from ${connection.id} exceeds size limit (${messageBytes} > ${GistRoom.MAX_MESSAGE_SIZE})`,
+			);
+			connection.close(4009, "Message too large");
+			return;
+		}
 
-  /**
-   * Handle HTTP requests to the DO
-   */
-  async onRequest(request: Request): Promise<Response> {
-    const url = new URL(request.url);
+		const now = Date.now();
+		const timestamps = this.messageCounts.get(connection.id) || [];
+		const windowStart = now - GistRoom.MESSAGE_RATE_WINDOW;
+		const recentTimestamps = timestamps.filter((ts) => ts > windowStart);
 
-    // Initialize room
-    if (url.pathname.endsWith("/initialize") && request.method === "POST") {
-      try {
-        const body = await request.json<{
-          gistId: string;
-          filename: string;
-          ownerUserId: string;
-          editTokenHash: string;
-        }>();
-        await this.initializeRoom(
-          body.gistId,
-          body.filename,
-          body.ownerUserId,
-          body.editTokenHash
-        );
-        return new Response(JSON.stringify({ ok: true }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (error) {
-        return new Response(
-          JSON.stringify({ ok: false, error: String(error) }),
-          { status: 500, headers: { "Content-Type": "application/json" } }
-        );
-      }
-    }
+		if (recentTimestamps.length >= GistRoom.MAX_MESSAGES_PER_WINDOW) {
+			console.log(
+				`[GistRoom ${this.name}] Rate limit exceeded for ${connection.id}`,
+			);
+			connection.close(4008, "Rate limit exceeded");
+			return;
+		}
 
-    // Get room metadata
-    if (url.pathname.endsWith("/meta") && request.method === "GET") {
-      return new Response(
-        JSON.stringify({
-          initialized: this.getMeta("initialized") === "true",
-          gistId: this.getMeta("gistId"),
-          filename: this.getMeta("filename"),
-          ownerUserId: this.getMeta("ownerUserId"),
-          pendingSync: this.getMeta("pendingSync") === "true",
-          lastCanonicalMarkdown: this.loadCanonicalMarkdown(),
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
-      );
-    }
+		recentTimestamps.push(now);
+		this.messageCounts.set(connection.id, recentTimestamps);
 
-    return new Response("Not found", { status: 404 });
-  }
+		await super.onMessage(connection, message);
+	}
 
-  // ============================================================================
-  // SQLite Schema and Helper Methods
-  // ============================================================================
+	onCustomMessage(connection: Connection, message: string): void {
+		try {
+			const parsed = decodeMessage(message);
 
-  private ensureSchema(): void {
-    // Room metadata table
-    this.ctx.storage.sql.exec(`
+			switch (parsed.type) {
+				case MessageTypeCanonicalMarkdown:
+					this.handleCanonicalMarkdown(
+						connection,
+						parsed.payload as CanonicalMarkdownPayload,
+					);
+					break;
+
+				case MessageTypePushLocal:
+					this.handlePushLocal();
+					break;
+
+				case MessageTypeDiscardLocal:
+					this.handleDiscardLocal();
+					break;
+
+				default:
+					console.log(
+						`[GistRoom ${this.name}] Unknown message type: ${parsed.type}`,
+					);
+			}
+		} catch (error) {
+			console.error(
+				`[GistRoom ${this.name}] Error handling custom message:`,
+				error,
+			);
+		}
+	}
+
+	isReadOnly(connection: Connection): boolean {
+		const cap = this.connectionCapabilities.get(connection.id);
+		return !cap?.canEdit;
+	}
+
+	// ============================================================================
+	// HTTP Request Handler (for DO RPC)
+	// ============================================================================
+
+	async onRequest(request: Request): Promise<Response> {
+		const url = new URL(request.url);
+
+		if (url.pathname.endsWith("/initialize") && request.method === "POST") {
+			try {
+				const body = await request.json<{
+					gistId: string;
+					filename: string;
+					ownerUserId: string;
+					editTokenHash: string;
+				}>();
+				await this.initializeRoom(
+					body.gistId,
+					body.filename,
+					body.ownerUserId,
+					body.editTokenHash,
+				);
+				return new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			} catch (error) {
+				return new Response(
+					JSON.stringify({ ok: false, error: String(error) }),
+					{ status: 500, headers: { "Content-Type": "application/json" } },
+				);
+			}
+		}
+
+		if (url.pathname.endsWith("/meta") && request.method === "GET") {
+			return new Response(
+				JSON.stringify({
+					initialized: this.getMeta("initialized") === "true",
+					gistId: this.getMeta("gistId"),
+					filename: this.getMeta("filename"),
+					ownerUserId: this.getMeta("ownerUserId"),
+					pendingSync: this.getMeta("pendingSync") === "true",
+					etag: this.getMeta("etag"),
+					snapshotUpdatedAt: this.snapshotUpdatedAt,
+					syncState: this.syncState,
+					lastCanonicalMarkdown: this.loadCanonicalMarkdown(),
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		}
+
+		if (url.pathname.endsWith("/verify-token") && request.method === "POST") {
+			try {
+				const body = await request.json<{ tokenHash: string }>();
+				const storedHash = this.getMeta("editTokenHash");
+				const valid = storedHash !== null && storedHash === body.tokenHash;
+				return new Response(JSON.stringify({ valid }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			} catch {
+				return new Response(
+					JSON.stringify({ valid: false }),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				);
+			}
+		}
+
+		if (url.pathname.endsWith("/update-token") && request.method === "POST") {
+			try {
+				const body = await request.json<{ editTokenHash: string }>();
+				this.setMeta("editTokenHash", body.editTokenHash);
+
+				for (const conn of this.getConnections()) {
+					const cap = this.connectionCapabilities.get(conn.id);
+					if (cap?.canEdit) {
+						conn.close(4010, "Edit token revoked");
+					}
+				}
+
+				return new Response(JSON.stringify({ ok: true }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			} catch (error) {
+				return new Response(
+					JSON.stringify({ ok: false, error: String(error) }),
+					{ status: 500, headers: { "Content-Type": "application/json" } },
+				);
+			}
+		}
+
+		return new Response("Not found", { status: 404 });
+	}
+
+	// ============================================================================
+	// GitHub Sync
+	// ============================================================================
+
+	private async syncToGitHub(markdown: string): Promise<void> {
+		const gistId = this.getMeta("gistId");
+		const filename = this.getMeta("filename");
+		const storedEtag = this.getMeta("etag");
+
+		if (!gistId || !filename || !this.ownerToken) return;
+
+		this.broadcastSyncStatus("saving");
+
+		const headers: Record<string, string> = {
+			Authorization: `Bearer ${this.ownerToken}`,
+			Accept: "application/vnd.github.v3+json",
+			"User-Agent": "gist-party",
+			"Content-Type": "application/json",
+		};
+		if (storedEtag) {
+			headers["If-Match"] = storedEtag;
+		}
+
+		try {
+			const response = await fetch(
+				`https://api.github.com/gists/${gistId}`,
+				{
+					method: "PATCH",
+					headers,
+					body: JSON.stringify({
+						files: { [filename]: { content: markdown } },
+					}),
+				},
+			);
+
+			if (response.ok) {
+				const etag = response.headers.get("ETag");
+				if (etag) {
+					this.setMeta("etag", etag);
+				}
+				this.setMeta("updatedAt", new Date().toISOString());
+				this.setMeta("pendingSync", "false");
+				this.retryAttempt = 0;
+				this.broadcastSyncStatus("saved");
+				console.log(
+					`[GistRoom ${this.name}] Synced to GitHub successfully`,
+				);
+			} else if (response.status === 412) {
+				await this.handle412Conflict();
+			} else {
+				await this.handleSyncError(response.status);
+			}
+		} catch (error) {
+			console.error(
+				`[GistRoom ${this.name}] GitHub sync fetch error:`,
+				error,
+			);
+			await this.handleSyncError(0);
+		}
+	}
+
+	private async handle412Conflict(): Promise<void> {
+		this.autoSyncPaused = true;
+
+		console.log(`[GistRoom ${this.name}] 412 conflict detected`);
+
+		const remote = await this.fetchRemoteGist();
+		if (!remote) return;
+
+		const filename = this.getMeta("filename");
+		if (!filename) return;
+
+		const remoteFile = remote.files?.[filename];
+		const remoteMarkdown = remoteFile?.content ?? "";
+
+		const message: CustomMessage = {
+			type: MessageTypeRemoteChanged,
+			payload: { remoteMarkdown },
+		};
+		this.broadcastCustomMessage(encodeMessage(message));
+		this.broadcastSyncStatus("conflict");
+	}
+
+	private async handleSyncError(statusCode: number): Promise<void> {
+		this.autoSyncPaused = true;
+		this.retryAttempt++;
+
+		const backoff = Math.min(
+			1000 * Math.pow(2, this.retryAttempt),
+			MAX_RETRY_BACKOFF_MS,
+		);
+
+		console.log(
+			`[GistRoom ${this.name}] Sync error (status: ${statusCode}), retry #${this.retryAttempt} in ${backoff}ms`,
+		);
+
+		const message: CustomMessage = {
+			type: MessageTypeErrorRetrying,
+			payload: {
+				attempt: this.retryAttempt,
+				nextRetryAt: Date.now() + backoff,
+			},
+		};
+		this.broadcastCustomMessage(encodeMessage(message));
+		this.broadcastSyncStatus("error-retrying");
+
+		if (this.retryTimeout) {
+			clearTimeout(this.retryTimeout);
+		}
+		this.retryTimeout = setTimeout(() => {
+			this.retryTimeout = null;
+			this.retrySyncToGitHub();
+		}, backoff);
+	}
+
+	private async retrySyncToGitHub(): Promise<void> {
+		this.autoSyncPaused = false;
+
+		const markdown = this.loadCanonicalMarkdown();
+		if (!markdown || !this.ownerToken) {
+			console.log(
+				`[GistRoom ${this.name}] Retry aborted - no markdown or owner token`,
+			);
+			return;
+		}
+
+		await this.syncToGitHub(markdown);
+	}
+
+	private async fetchRemoteGist(): Promise<GitHubGistResponse | null> {
+		const gistId = this.getMeta("gistId");
+		if (!gistId || !this.ownerToken) return null;
+
+		try {
+			const response = await fetch(
+				`https://api.github.com/gists/${gistId}`,
+				{
+					headers: {
+						Authorization: `Bearer ${this.ownerToken}`,
+						Accept: "application/vnd.github.v3+json",
+						"User-Agent": "gist-party",
+					},
+				},
+			);
+
+			if (!response.ok) {
+				console.error(
+					`[GistRoom ${this.name}] Failed to fetch remote gist: ${response.status}`,
+				);
+				return null;
+			}
+
+			const etag = response.headers.get("ETag");
+			if (etag) {
+				this.setMeta("etag", etag);
+			}
+
+			return (await response.json()) as GitHubGistResponse;
+		} catch (error) {
+			console.error(
+				`[GistRoom ${this.name}] Fetch remote gist error:`,
+				error,
+			);
+			return null;
+		}
+	}
+
+	private broadcastSyncStatus(state: SyncState, detail?: string): void {
+		this.syncState = state;
+		const message: CustomMessage = {
+			type: MessageTypeSyncStatus,
+			payload: { state, detail },
+		};
+		this.broadcastCustomMessage(encodeMessage(message));
+	}
+
+	// ============================================================================
+	// Owner Token Lifecycle
+	// ============================================================================
+
+	private async tryLoadOwnerToken(connection: Connection): Promise<void> {
+		if (this.ownerToken) return;
+
+		const ownerUserId = this.getMeta("ownerUserId");
+		if (!ownerUserId) return;
+
+		if (!this.isOwnerConnection(connection)) return;
+
+		try {
+			const sessionData = await this.env.SESSION_KV.get(
+				`session:${ownerUserId}`,
+			);
+			if (!sessionData) {
+				console.log(
+					`[GistRoom ${this.name}] No session found for owner ${ownerUserId}`,
+				);
+				return;
+			}
+
+			const session = JSON.parse(sessionData) as {
+				encryptedToken: string;
+			};
+
+			this.ownerToken = await decrypt(session.encryptedToken, {
+				currentKey: {
+					version: 1,
+					rawKey: this.env.ENCRYPTION_KEY_V1,
+				},
+				previousKeys: [],
+			});
+
+			console.log(
+				`[GistRoom ${this.name}] Owner token loaded for ${ownerUserId}`,
+			);
+		} catch (error) {
+			console.error(
+				`[GistRoom ${this.name}] Failed to load owner token:`,
+				error,
+			);
+		}
+	}
+
+	private isOwnerConnection(_connection: Connection): boolean {
+		// TODO: Check connection state for userId match against ownerUserId
+		// For now, treat all connections as potential owner connections
+		// This will be refined when auth is fully wired (Track 1A/3B)
+		return true;
+	}
+
+	private findOwnerConnection(
+		excludeId?: string,
+	): Connection | null {
+		for (const conn of this.getConnections()) {
+			if (excludeId && conn.id === excludeId) continue;
+			if (this.isOwnerConnection(conn)) return conn;
+		}
+		return null;
+	}
+
+	// ============================================================================
+	// Staleness Detection
+	// ============================================================================
+
+	private async checkStaleness(): Promise<void> {
+		if (!this.snapshotUpdatedAt || !this.ownerToken) return;
+
+		const initialized = this.getMeta("initialized");
+		if (initialized !== "true") return;
+
+		const snapshotAge =
+			Date.now() - new Date(this.snapshotUpdatedAt).getTime();
+		if (snapshotAge <= STALE_THRESHOLD_MS) return;
+
+		const pendingSync = this.getMeta("pendingSync");
+		if (pendingSync === "true") {
+			this.autoSyncPaused = true;
+			this.broadcastSyncStatus("conflict");
+			console.log(
+				`[GistRoom ${this.name}] Stale snapshot with pending sync - conflict`,
+			);
+			return;
+		}
+
+		const gistId = this.getMeta("gistId");
+		const storedEtag = this.getMeta("etag");
+		if (!gistId || !storedEtag) return;
+
+		try {
+			const response = await fetch(
+				`https://api.github.com/gists/${gistId}`,
+				{
+					headers: {
+						Authorization: `Bearer ${this.ownerToken}`,
+						Accept: "application/vnd.github.v3+json",
+						"User-Agent": "gist-party",
+						"If-None-Match": storedEtag,
+					},
+				},
+			);
+
+			if (response.status === 304) {
+				console.log(
+					`[GistRoom ${this.name}] Remote unchanged (304), snapshot is stale but current`,
+				);
+				return;
+			}
+
+			if (response.ok) {
+				const data = (await response.json()) as GitHubGistResponse;
+				const filename = this.getMeta("filename");
+				if (!filename) return;
+
+				const remoteFile = data.files?.[filename];
+				const remoteMarkdown = remoteFile?.content ?? "";
+
+				const etag = response.headers.get("ETag");
+				if (etag) {
+					this.setMeta("etag", etag);
+				}
+
+				const message: CustomMessage = {
+					type: MessageTypeReloadRemote,
+					payload: { markdown: remoteMarkdown },
+				};
+				this.broadcastCustomMessage(encodeMessage(message));
+
+				console.log(
+					`[GistRoom ${this.name}] Remote is newer, sent reload-remote`,
+				);
+			}
+		} catch (error) {
+			console.error(
+				`[GistRoom ${this.name}] Staleness check error:`,
+				error,
+			);
+		}
+	}
+
+	// ============================================================================
+	// Conflict Resolution Handlers
+	// ============================================================================
+
+	private async handlePushLocal(): Promise<void> {
+		this.autoSyncPaused = false;
+		this.retryAttempt = 0;
+
+		const markdown = this.loadCanonicalMarkdown();
+		if (markdown && this.ownerToken) {
+			this.setMeta("etag", "");
+			await this.syncToGitHub(markdown);
+		}
+	}
+
+	private handleDiscardLocal(): void {
+		this.autoSyncPaused = false;
+		this.retryAttempt = 0;
+		this.broadcastSyncStatus("saved");
+	}
+
+	// ============================================================================
+	// SQLite Schema and Helper Methods
+	// ============================================================================
+
+	private ensureSchema(): void {
+		this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS room_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       )
     `);
 
-    // Yjs snapshot table (single row, id = 1)
-    this.ctx.storage.sql.exec(`
+		this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS yjs_snapshot (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         data BLOB NOT NULL,
@@ -315,175 +725,211 @@ export class GistRoom extends YServer {
       )
     `);
 
-    // Canonical markdown table (single row, id = 1)
-    this.ctx.storage.sql.exec(`
+		this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS canonical_markdown (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         content TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       )
     `);
-  }
+	}
 
-  // ---------------------------------------------------------------------------
-  // Metadata Helpers
-  // ---------------------------------------------------------------------------
+	// ---------------------------------------------------------------------------
+	// Metadata Helpers
+	// ---------------------------------------------------------------------------
 
-  private getMeta(key: string): string | null {
-    try {
-      const result = this.ctx.storage.sql.exec(
-        `SELECT value FROM room_meta WHERE key = ?`,
-        key
-      );
-      const row = result.one() as { value: string } | null;
-      return row?.value ?? null;
-    } catch {
-      return null;
-    }
-  }
+	private getMeta(key: string): string | null {
+		try {
+			const result = this.ctx.storage.sql.exec(
+				`SELECT value FROM room_meta WHERE key = ?`,
+				key,
+			);
+			const row = result.one() as { value: string } | null;
+			return row?.value ?? null;
+		} catch {
+			return null;
+		}
+	}
 
-  private setMeta(key: string, value: string): void {
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO room_meta (key, value) VALUES (?, ?)`,
-      key,
-      value
-    );
-  }
+	private setMeta(key: string, value: string): void {
+		this.ctx.storage.sql.exec(
+			`INSERT OR REPLACE INTO room_meta (key, value) VALUES (?, ?)`,
+			key,
+			value,
+		);
+	}
 
-  // ---------------------------------------------------------------------------
-  // Yjs Snapshot Helpers
-  // ---------------------------------------------------------------------------
+	// ---------------------------------------------------------------------------
+	// Yjs Snapshot Helpers
+	// ---------------------------------------------------------------------------
 
-  private loadSnapshot(): Uint8Array | null {
-    try {
-      const result = this.ctx.storage.sql.exec(
-        `SELECT data FROM yjs_snapshot WHERE id = 1`
-      );
-      const row = result.one() as { data: ArrayBuffer } | null;
-      if (row?.data) {
-        return new Uint8Array(row.data);
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  }
+	private loadSnapshot(): { data: Uint8Array; updatedAt: string } | null {
+		try {
+			const result = this.ctx.storage.sql.exec(
+				`SELECT data, updated_at FROM yjs_snapshot WHERE id = 1`,
+			);
+			const row = result.one() as {
+				data: ArrayBuffer;
+				updated_at: string;
+			} | null;
+			if (row?.data) {
+				return {
+					data: new Uint8Array(row.data),
+					updatedAt: row.updated_at,
+				};
+			}
+			return null;
+		} catch {
+			return null;
+		}
+	}
 
-  private saveSnapshot(data: Uint8Array): void {
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO yjs_snapshot (id, data, updated_at) 
+	private saveSnapshot(data: Uint8Array): void {
+		this.ctx.storage.sql.exec(
+			`INSERT OR REPLACE INTO yjs_snapshot (id, data, updated_at) 
        VALUES (1, ?, datetime('now'))`,
-      data
-    );
-  }
+			data,
+		);
+		this.snapshotUpdatedAt = new Date().toISOString();
+	}
 
-  // ---------------------------------------------------------------------------
-  // Canonical Markdown Helpers
-  // ---------------------------------------------------------------------------
+	// ---------------------------------------------------------------------------
+	// Canonical Markdown Helpers
+	// ---------------------------------------------------------------------------
 
-  private loadCanonicalMarkdown(): string | null {
-    try {
-      const result = this.ctx.storage.sql.exec(
-        `SELECT content FROM canonical_markdown WHERE id = 1`
-      );
-      const row = result.one() as { content: string } | null;
-      return row?.content ?? null;
-    } catch {
-      return null;
-    }
-  }
+	private loadCanonicalMarkdown(): string | null {
+		try {
+			const result = this.ctx.storage.sql.exec(
+				`SELECT content FROM canonical_markdown WHERE id = 1`,
+			);
+			const row = result.one() as { content: string } | null;
+			return row?.content ?? null;
+		} catch {
+			return null;
+		}
+	}
 
-  private saveCanonicalMarkdown(markdown: string): void {
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO canonical_markdown (id, content, updated_at) 
+	private saveCanonicalMarkdown(markdown: string): void {
+		this.ctx.storage.sql.exec(
+			`INSERT OR REPLACE INTO canonical_markdown (id, content, updated_at) 
        VALUES (1, ?, datetime('now'))`,
-      markdown
-    );
-  }
+			markdown,
+		);
+	}
 
-  // ============================================================================
-  // Room Initialization
-  // ============================================================================
+	// ============================================================================
+	// Room Initialization
+	// ============================================================================
 
-  async initializeRoom(
-    gistId: string,
-    filename: string,
-    ownerUserId: string,
-    editTokenHash: string
-  ): Promise<void> {
-    this.setMeta("initialized", "true");
-    this.setMeta("gistId", gistId);
-    this.setMeta("filename", filename);
-    this.setMeta("ownerUserId", ownerUserId);
-    this.setMeta("editTokenHash", editTokenHash);
-    this.setMeta("pendingSync", "false");
-    console.log(`[GistRoom ${this.name}] Room initialized for gist ${gistId}`);
-  }
+	async initializeRoom(
+		gistId: string,
+		filename: string,
+		ownerUserId: string,
+		editTokenHash: string,
+	): Promise<void> {
+		this.setMeta("initialized", "true");
+		this.setMeta("gistId", gistId);
+		this.setMeta("filename", filename);
+		this.setMeta("ownerUserId", ownerUserId);
+		this.setMeta("editTokenHash", editTokenHash);
+		this.setMeta("pendingSync", "false");
+		console.log(`[GistRoom ${this.name}] Room initialized for gist ${gistId}`);
+	}
 
-  // ============================================================================
-  // Markdown Protocol
-  // ============================================================================
+	// ============================================================================
+	// Markdown Protocol
+	// ============================================================================
 
-  /**
-   * Request canonical markdown from an authorized client
-   */
-  private async requestCanonicalMarkdown(): Promise<string | null> {
-    const authorizedConnection = this.getAuthorizedConnection();
-    if (!authorizedConnection) {
-      console.log(`[GistRoom ${this.name}] No authorized connection for markdown request`);
-      return null;
-    }
+	private async requestCanonicalMarkdown(): Promise<string | null> {
+		const authorizedConnection = this.getAuthorizedConnection();
+		if (!authorizedConnection) {
+			console.log(
+				`[GistRoom ${this.name}] No authorized connection for markdown request`,
+			);
+			return null;
+		}
 
-    const requestId = crypto.randomUUID();
-    const message: CustomMessage = {
-      type: MessageTypeRequestMarkdown,
-      payload: { requestId },
-    };
+		const requestId = crypto.randomUUID();
+		const message: CustomMessage = {
+			type: MessageTypeRequestMarkdown,
+			payload: { requestId },
+		};
 
-    this.sendCustomMessage(authorizedConnection, encodeMessage(message));
-    console.log(`[GistRoom ${this.name}] Requested markdown (requestId: ${requestId})`);
+		this.sendCustomMessage(authorizedConnection, encodeMessage(message));
+		console.log(
+			`[GistRoom ${this.name}] Requested markdown (requestId: ${requestId})`,
+		);
 
-    // Wait for response with timeout
-    return new Promise<string | null>((resolve) => {
-      const timeout = setTimeout(() => {
-        console.log(`[GistRoom ${this.name}] Markdown request timeout (requestId: ${requestId})`);
-        this.pendingMarkdownRequests.delete(requestId);
-        resolve(null);
-      }, 5000); // 5 second timeout
+		return new Promise<string | null>((resolve) => {
+			const timeout = setTimeout(() => {
+				console.log(
+					`[GistRoom ${this.name}] Markdown request timeout (requestId: ${requestId})`,
+				);
+				this.pendingMarkdownRequests.delete(requestId);
+				resolve(null);
+			}, 5000);
 
-      this.pendingMarkdownRequests.set(requestId, { resolve, timeout });
-    });
-  }
+			this.pendingMarkdownRequests.set(requestId, { resolve, timeout });
+		});
+	}
 
-  /**
-   * Handle canonical markdown response from client
-   */
-  private handleCanonicalMarkdown(
-    _connection: Connection,
-    payload: CanonicalMarkdownPayload
-  ): void {
-    const pending = this.pendingMarkdownRequests.get(payload.requestId);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      this.pendingMarkdownRequests.delete(payload.requestId);
-      this.saveCanonicalMarkdown(payload.markdown);
-      console.log(`[GistRoom ${this.name}] Saved canonical markdown (${payload.markdown.length} chars)`);
-      pending.resolve(payload.markdown);
-    } else {
-      console.log(`[GistRoom ${this.name}] Received markdown for unknown/expired requestId: ${payload.requestId}`);
-    }
-  }
+	private handleCanonicalMarkdown(
+		_connection: Connection,
+		payload: CanonicalMarkdownPayload,
+	): void {
+		const pending = this.pendingMarkdownRequests.get(payload.requestId);
+		if (pending) {
+			clearTimeout(pending.timeout);
+			this.pendingMarkdownRequests.delete(payload.requestId);
+			this.saveCanonicalMarkdown(payload.markdown);
+			console.log(
+				`[GistRoom ${this.name}] Saved canonical markdown (${payload.markdown.length} chars)`,
+			);
+			pending.resolve(payload.markdown);
+		} else {
+			console.log(
+				`[GistRoom ${this.name}] Received markdown for unknown/expired requestId: ${payload.requestId}`,
+			);
+		}
+	}
 
-  /**
-   * Get an authorized connection for making requests
-   * For Phase 1, returns any connected client
-   */
-  private getAuthorizedConnection(): Connection | null {
-    // For Phase 1, return the first connected client
-    // In Phase 3B, this will check edit capability
-    for (const connection of this.getConnections()) {
-      return connection;
-    }
-    return null;
-  }
+	private getAuthorizedConnection(): Connection | null {
+		for (const connection of this.getConnections()) {
+			const cap = this.connectionCapabilities.get(connection.id);
+			if (cap?.canEdit) return connection;
+		}
+		return null;
+	}
+
+	// ============================================================================
+	// Edit Capability
+	// ============================================================================
+
+	private async checkEditCapability(ctx: ConnectionContext): Promise<boolean> {
+		const cookieHeader = ctx.request.headers.get("cookie");
+		if (!cookieHeader) return false;
+
+		const match = cookieHeader.match(/gp_edit_cap=([^;]+)/);
+		if (!match) return false;
+
+		const gistId = this.getMeta("gistId");
+		if (!gistId) return false;
+
+		const payload = await verifyEditCookie(
+			match[1],
+			gistId,
+			this.env.JWT_SECRET,
+		);
+		return payload !== null;
+	}
+}
+
+interface GitHubGistFile {
+	filename: string;
+	content: string;
+}
+
+interface GitHubGistResponse {
+	files: Record<string, GitHubGistFile>;
+	updated_at: string;
 }

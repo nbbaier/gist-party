@@ -1,80 +1,98 @@
 .gist-page {
-  padding: 1rem 0;
+	padding: 1rem 0;
 }
 
 .gist-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 1.5rem;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid #e1e4e8;
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 1.5rem;
+	padding-bottom: 1rem;
+	border-bottom: 1px solid #e1e4e8;
 }
 
 .gist-header h2 {
-  font-size: 1.5rem;
-  font-weight: 600;
-  color: #24292e;
-  margin: 0;
+	font-size: 1.5rem;
+	font-weight: 600;
+	color: #24292e;
+	margin: 0;
 }
 
 .gist-actions {
-  display: flex;
-  gap: 0.5rem;
+	display: flex;
+	gap: 0.5rem;
 }
 
 .btn {
-  padding: 0.5rem 1rem;
-  font-size: 14px;
-  font-weight: 500;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background-color 0.2s;
+	padding: 0.5rem 1rem;
+	font-size: 14px;
+	font-weight: 500;
+	border: none;
+	border-radius: 6px;
+	cursor: pointer;
+	transition: background-color 0.2s;
 }
 
 .btn-secondary {
-  background-color: #f6f8fa;
-  color: #24292e;
-  border: 1px solid #e1e4e8;
+	background-color: #f6f8fa;
+	color: #24292e;
+	border: 1px solid #e1e4e8;
 }
 
 .btn-secondary:hover {
-  background-color: #f3f4f6;
+	background-color: #f3f4f6;
 }
 
 .editor-wrapper {
-  margin-bottom: 2rem;
+	margin-bottom: 2rem;
 }
 
 .export-preview {
-  margin-top: 2rem;
-  padding: 1rem;
-  background-color: #f6f8fa;
-  border: 1px solid #e1e4e8;
-  border-radius: 6px;
+	margin-top: 2rem;
+	padding: 1rem;
+	background-color: #f6f8fa;
+	border: 1px solid #e1e4e8;
+	border-radius: 6px;
 }
 
 .export-preview h3 {
-  margin-top: 0;
-  margin-bottom: 1rem;
-  font-size: 1rem;
-  color: #24292e;
+	margin-top: 0;
+	margin-bottom: 1rem;
+	font-size: 1rem;
+	color: #24292e;
+}
+
+.view-badge {
+  display: inline-block;
+  padding: 0.25rem 0.75rem;
+  font-size: 12px;
+  font-weight: 500;
+  color: #586069;
+  background-color: #f1f8ff;
+  border: 1px solid #c8e1ff;
+  border-radius: 12px;
+}
+
+.viewer-wrapper {
+  border: 1px solid #e1e4e8;
+  border-radius: 6px;
+  background-color: #fff;
+  margin-bottom: 2rem;
 }
 
 .export-content {
-  margin: 0;
-  padding: 1rem;
-  background-color: #fff;
-  border: 1px solid #e1e4e8;
-  border-radius: 3px;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier,
-    monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  max-height: 300px;
-  overflow-y: auto;
+	margin: 0;
+	padding: 1rem;
+	background-color: #fff;
+	border: 1px solid #e1e4e8;
+	border-radius: 3px;
+	font-family:
+		"SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+	font-size: 12px;
+	line-height: 1.5;
+	overflow-x: auto;
+	white-space: pre-wrap;
+	word-wrap: break-word;
+	max-height: 300px;
+	overflow-y: auto;
 }

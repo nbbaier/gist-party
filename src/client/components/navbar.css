@@ -1,59 +1,59 @@
 .navbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 1rem 2rem;
-  background-color: #24292e;
-  color: #fff;
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: 1rem 2rem;
+	background-color: #24292e;
+	color: #fff;
 }
 
 .navbar-brand {
-  font-size: 1.5rem;
-  font-weight: 600;
+	font-size: 1.5rem;
+	font-weight: 600;
 }
 
 .navbar-logo {
-  color: #fff;
-  text-decoration: none;
+	color: #fff;
+	text-decoration: none;
 }
 
 .navbar-logo:hover {
-  color: #79b8ff;
+	color: #79b8ff;
 }
 
 .navbar-auth {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
+	display: flex;
+	align-items: center;
+	gap: 1rem;
 }
 
 .navbar-signin {
-  padding: 0.5rem 1rem;
-  background-color: #2ea44f;
-  color: #fff;
-  text-decoration: none;
-  border-radius: 6px;
-  font-size: 14px;
-  font-weight: 500;
+	padding: 0.5rem 1rem;
+	background-color: #2ea44f;
+	color: #fff;
+	text-decoration: none;
+	border-radius: 6px;
+	font-size: 14px;
+	font-weight: 500;
 }
 
 .navbar-signin:hover {
-  background-color: #2c974b;
+	background-color: #2c974b;
 }
 
 .navbar-user {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
 }
 
 .navbar-avatar {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
+	width: 24px;
+	height: 24px;
+	border-radius: 50%;
 }
 
 .navbar-username {
-  font-size: 14px;
-  color: #fff;
+	font-size: 14px;
+	color: #fff;
 }

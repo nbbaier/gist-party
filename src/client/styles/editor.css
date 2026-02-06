@@ -1,36 +1,36 @@
 .editor-container {
-  width: 100%;
-  min-height: 400px;
-  padding: 1rem;
-  border: 1px solid #e1e4e8;
-  border-radius: 6px;
-  background: #ffffff;
+	width: 100%;
+	min-height: 400px;
+	padding: 1rem;
+	border: 1px solid #e1e4e8;
+	border-radius: 6px;
+	background: #ffffff;
 }
 
 .editor-container.readonly {
-  background: #f6f8fa;
+	background: #f6f8fa;
 }
 
 .editor-loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 200px;
-  color: #586069;
-  font-size: 14px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 200px;
+	color: #586069;
+	font-size: 14px;
 }
 
 /* Milkdown default styles override */
 .milkdown {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
-    sans-serif;
-  font-size: 16px;
-  line-height: 1.6;
-  color: #24292e;
+	font-family:
+		-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+	font-size: 16px;
+	line-height: 1.6;
+	color: #24292e;
 }
 
 .milkdown p {
-  margin: 0 0 16px 0;
+	margin: 0 0 16px 0;
 }
 
 .milkdown h1,
@@ -39,168 +39,168 @@
 .milkdown h4,
 .milkdown h5,
 .milkdown h6 {
-  margin-top: 24px;
-  margin-bottom: 16px;
-  font-weight: 600;
-  line-height: 1.25;
+	margin-top: 24px;
+	margin-bottom: 16px;
+	font-weight: 600;
+	line-height: 1.25;
 }
 
 .milkdown h1 {
-  font-size: 2em;
-  border-bottom: 1px solid #eaecef;
-  padding-bottom: 0.3em;
+	font-size: 2em;
+	border-bottom: 1px solid #eaecef;
+	padding-bottom: 0.3em;
 }
 
 .milkdown h2 {
-  font-size: 1.5em;
-  border-bottom: 1px solid #eaecef;
-  padding-bottom: 0.3em;
+	font-size: 1.5em;
+	border-bottom: 1px solid #eaecef;
+	padding-bottom: 0.3em;
 }
 
 .milkdown h3 {
-  font-size: 1.25em;
+	font-size: 1.25em;
 }
 
 .milkdown ul,
 .milkdown ol {
-  padding-left: 2em;
-  margin-bottom: 16px;
+	padding-left: 2em;
+	margin-bottom: 16px;
 }
 
 .milkdown li + li {
-  margin-top: 0.25em;
+	margin-top: 0.25em;
 }
 
 .milkdown blockquote {
-  padding: 0 1em;
-  color: #6a737d;
-  border-left: 0.25em solid #dfe2e5;
-  margin: 0 0 16px 0;
+	padding: 0 1em;
+	color: #6a737d;
+	border-left: 0.25em solid #dfe2e5;
+	margin: 0 0 16px 0;
 }
 
 .milkdown code {
-  padding: 0.2em 0.4em;
-  margin: 0;
-  font-size: 85%;
-  background-color: rgba(27, 31, 35, 0.05);
-  border-radius: 3px;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier,
-    monospace;
+	padding: 0.2em 0.4em;
+	margin: 0;
+	font-size: 85%;
+	background-color: rgba(27, 31, 35, 0.05);
+	border-radius: 3px;
+	font-family:
+		"SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
 }
 
 .milkdown pre {
-  padding: 16px;
-  overflow: auto;
-  font-size: 85%;
-  line-height: 1.45;
-  background-color: #f6f8fa;
-  border-radius: 6px;
-  margin-bottom: 16px;
+	padding: 16px;
+	overflow: auto;
+	font-size: 85%;
+	line-height: 1.45;
+	background-color: #f6f8fa;
+	border-radius: 6px;
+	margin-bottom: 16px;
 }
 
 .milkdown pre code {
-  display: inline;
-  padding: 0;
-  margin: 0;
-  overflow: visible;
-  line-height: inherit;
-  word-wrap: normal;
-  background-color: transparent;
-  border: 0;
+	display: inline;
+	padding: 0;
+	margin: 0;
+	overflow: visible;
+	line-height: inherit;
+	word-wrap: normal;
+	background-color: transparent;
+	border: 0;
 }
 
 .milkdown table {
-  display: block;
-  width: 100%;
-  overflow: auto;
-  border-spacing: 0;
-  border-collapse: collapse;
-  margin-bottom: 16px;
+	display: block;
+	width: 100%;
+	overflow: auto;
+	border-spacing: 0;
+	border-collapse: collapse;
+	margin-bottom: 16px;
 }
 
 .milkdown table th,
 .milkdown table td {
-  padding: 6px 13px;
-  border: 1px solid #dfe2e5;
+	padding: 6px 13px;
+	border: 1px solid #dfe2e5;
 }
 
 .milkdown table tr {
-  background-color: #fff;
-  border-top: 1px solid #c6cbd1;
+	background-color: #fff;
+	border-top: 1px solid #c6cbd1;
 }
 
 .milkdown table tr:nth-child(2n) {
-  background-color: #f6f8fa;
+	background-color: #f6f8fa;
 }
 
 .milkdown table th {
-  font-weight: 600;
-  background-color: #f6f8fa;
+	font-weight: 600;
+	background-color: #f6f8fa;
 }
 
 .milkdown hr {
-  height: 0.25em;
-  padding: 0;
-  margin: 24px 0;
-  background-color: #e1e4e8;
-  border: 0;
+	height: 0.25em;
+	padding: 0;
+	margin: 24px 0;
+	background-color: #e1e4e8;
+	border: 0;
 }
 
 .milkdown a {
-  color: #0366d6;
-  text-decoration: none;
+	color: #0366d6;
+	text-decoration: none;
 }
 
 .milkdown a:hover {
-  text-decoration: underline;
+	text-decoration: underline;
 }
 
 .milkdown img {
-  max-width: 100%;
-  box-sizing: content-box;
-  background-color: #fff;
+	max-width: 100%;
+	box-sizing: content-box;
+	background-color: #fff;
 }
 
 /* Task list styling */
 .milkdown li[data-task-list-item] {
-  list-style-type: none;
+	list-style-type: none;
 }
 
 .milkdown li[data-task-list-item] input[type="checkbox"] {
-  margin-right: 0.5em;
-  margin-left: -1.5em;
+	margin-right: 0.5em;
+	margin-left: -1.5em;
 }
 
 /* Collaboration cursor styles */
 .yRemoteSelection {
-  background-color: var(--user-color-light, rgba(48, 188, 237, 0.2));
-  border-left: none;
-  border-right: none;
-  margin-right: -1px;
+	background-color: var(--user-color-light, rgba(48, 188, 237, 0.2));
+	border-left: none;
+	border-right: none;
+	margin-right: -1px;
 }
 
 .yRemoteSelectionHead {
-  position: absolute;
-  border-left: 2px solid var(--user-color, #30bced);
-  border-top: none;
-  border-bottom: none;
-  height: 100%;
-  box-sizing: border-box;
+	position: absolute;
+	border-left: 2px solid var(--user-color, #30bced);
+	border-top: none;
+	border-bottom: none;
+	height: 100%;
+	box-sizing: border-box;
 }
 
 .yRemoteSelectionHead::after {
-  content: attr(data-user-name);
-  position: absolute;
-  top: -1.4em;
-  left: -2px;
-  padding: 1px 6px;
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1.4;
-  white-space: nowrap;
-  border-radius: 3px 3px 3px 0;
-  background-color: var(--user-color, #30bced);
-  color: #fff;
-  pointer-events: none;
-  opacity: 0.9;
+	content: attr(data-user-name);
+	position: absolute;
+	top: -1.4em;
+	left: -2px;
+	padding: 1px 6px;
+	font-size: 11px;
+	font-weight: 500;
+	line-height: 1.4;
+	white-space: nowrap;
+	border-radius: 3px 3px 3px 0;
+	background-color: var(--user-color, #30bced);
+	color: #fff;
+	pointer-events: none;
+	opacity: 0.9;
 }

@@ -1,8 +1,8 @@
 import type {
-  RequestMarkdownPayload,
-  CanonicalMarkdownPayload,
-  NeedsInitPayload,
-  ReloadRemotePayload,
+	CanonicalMarkdownPayload,
+	NeedsInitPayload,
+	ReloadRemotePayload,
+	RequestMarkdownPayload,
 } from "./messages";
 
 /**
@@ -39,8 +39,8 @@ import type {
 export const MARKDOWN_REQUEST_TIMEOUT_MS = 5000;
 
 export type {
-  RequestMarkdownPayload,
-  CanonicalMarkdownPayload,
-  NeedsInitPayload,
-  ReloadRemotePayload,
+	RequestMarkdownPayload,
+	CanonicalMarkdownPayload,
+	NeedsInitPayload,
+	ReloadRemotePayload,
 };

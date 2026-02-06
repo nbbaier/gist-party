@@ -22,22 +22,22 @@ export const GIST_ROOM_SCHEMA = `
 `;
 
 export interface RoomMeta {
-  id: 1;
-  gist_id: string;
-  filename: string;
-  etag: string | null;
-  updated_at: string | null;
-  edit_token_hash: string | null;
-  last_saved_at: string | null;
-  pending_sync: 0 | 1;
-  pending_since: string | null;
-  initialized: 0 | 1;
-  owner_user_id: string;
-  last_canonical_markdown: string | null;
+	id: 1;
+	gist_id: string;
+	filename: string;
+	etag: string | null;
+	updated_at: string | null;
+	edit_token_hash: string | null;
+	last_saved_at: string | null;
+	pending_sync: 0 | 1;
+	pending_since: string | null;
+	initialized: 0 | 1;
+	owner_user_id: string;
+	last_canonical_markdown: string | null;
 }
 
 export interface YjsSnapshot {
-  id: 1;
-  snapshot: ArrayBuffer;
-  saved_at: string;
+	id: 1;
+	snapshot: ArrayBuffer;
+	saved_at: string;
 }
