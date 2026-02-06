@@ -359,14 +359,14 @@ All 12 user flows pass. All security checks verified. Ready for first deploy.
 Phase 0 (scaffolding)
   │
   ├── Track 1A (auth) ──────────┐
-  │                              ├── Track 2B (API routes) ──┐
-  ├── Track 1C (GistRoom DO) ───┤                            ├── Track 3A (GitHub sync) ──► Phase 4 (conflicts + status UX)
-  │                              ├── Track 2A (collab) ──────┤
-  ├── Track 1B (editor) ────────┘                            ├── Track 3B (edit permissions)
-  │                                                          │
-  │                                                          ├── Track 3C (read-only views)
-  │                                                          │
-  │                                                          └── Phase 5 (security hardening)
+  │                             ├── Track 2B (API routes) ──┐
+  ├── Track 1C (GistRoom DO) ───┤                           ├── Track 3A (GitHub sync) ──► Phase 4 (conflicts + status UX)
+  │                             ├── Track 2A (collab) ──────┤
+  ├── Track 1B (editor) ────────┘                           ├── Track 3B (edit permissions)
+  │                                                         │
+  │                                                         ├── Track 3C (read-only views)
+  │                                                         │
+  │                                                         └── Phase 5 (security hardening)
   │
   Phase 4 + Phase 5 ──► Phase 6 (end-to-end validation)
 ```
