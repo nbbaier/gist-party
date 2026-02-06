@@ -6,14 +6,22 @@ import {
   useRef,
   useState,
 } from "react";
-import { Milkdown, MilkdownProvider, useEditor } from "@milkdown/react";
+import {
+  Milkdown,
+  MilkdownProvider,
+  useEditor,
+  useInstance,
+} from "@milkdown/react";
+import { Editor as MilkdownEditor, rootCtx, defaultValueCtx } from "@milkdown/core";
 import { commonmark } from "@milkdown/preset-commonmark";
 import { gfm } from "@milkdown/preset-gfm";
 import { listener, listenerCtx } from "@milkdown/plugin-listener";
-import { getMarkdown } from "@milkdown/utils/lib/macro/get-markdown";
-import type { Ctx } from "@milkdown/ctx";
+import { getMarkdown } from "@milkdown/utils";
+import { collab, collabServiceCtx, CollabReady } from "@milkdown/plugin-collab";
+import type { Doc } from "yjs";
+import type { Awareness } from "y-protocols/awareness";
 
-import "./editor.css";
+import "../styles/editor.css";
 
 export interface EditorHandle {
   getMarkdown: () => string;
@@ -25,23 +33,27 @@ export interface EditorProps {
   defaultValue?: string;
   onChange?: (markdown: string) => void;
   readonly?: boolean;
+  doc?: Doc | null;
+  awareness?: Awareness | null;
 }
 
 function EditorComponent(
-  { defaultValue = "", onChange, readonly = false }: EditorProps,
-  ref: React.Ref<EditorHandle>
+  { defaultValue = "", onChange, readonly = false, doc, awareness }: EditorProps,
+  ref: React.Ref<EditorHandle>,
 ) {
-  const ctxRef = useRef<Ctx | null>(null);
   const [isDirty, setIsDirty] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSavedRef = useRef(defaultValue);
 
-  const { loading, get } = useEditor(
-    (root) => {
-      const editor = root
+  useEditor(
+    (container) => {
+      const editor = MilkdownEditor.make()
         .config((ctx) => {
-          ctx.set(listenerCtx, new listener());
-          ctx.get(listenerCtx).markdownUpdated((ctx, markdown) => {
+          ctx.set(rootCtx, container);
+          if (defaultValue && !doc) {
+            ctx.set(defaultValueCtx, defaultValue);
+          }
+          ctx.get(listenerCtx).markdownUpdated((_ctx, markdown) => {
             if (debounceRef.current) {
               clearTimeout(debounceRef.current);
             }
@@ -55,26 +67,47 @@ function EditorComponent(
         .use(gfm)
         .use(listener);
 
-      if (defaultValue) {
-        // Milkdown will parse the defaultValue markdown on initialization
+      if (doc) {
+        editor.use(collab);
       }
 
       return editor;
     },
-    [defaultValue, onChange]
+    [defaultValue, onChange, doc],
   );
 
-  // Store ctx reference when editor is ready
-  useEffect(() => {
-    const editor = get();
-    if (editor && !loading) {
-      editor.create().then((ctx) => {
-        ctxRef.current = ctx;
-      });
-    }
-  }, [get, loading]);
+  const [loading, getInstance] = useInstance();
 
-  // Cleanup debounce on unmount
+  useEffect(() => {
+    if (loading || !doc) return;
+
+    const editor = getInstance();
+    if (!editor) return;
+
+    const ctx = editor.ctx;
+    let cancelled = false;
+
+    ctx.wait(CollabReady).then(() => {
+      if (cancelled) return;
+      const collabService = ctx.get(collabServiceCtx);
+      collabService.bindDoc(doc);
+      if (awareness) {
+        collabService.setAwareness(awareness);
+      }
+      collabService.connect();
+    });
+
+    return () => {
+      cancelled = true;
+      try {
+        const collabService = ctx.get(collabServiceCtx);
+        collabService.disconnect();
+      } catch {
+        // editor may already be destroyed
+      }
+    };
+  }, [loading, getInstance, doc, awareness]);
+
   useEffect(() => {
     return () => {
       if (debounceRef.current) {
@@ -84,9 +117,15 @@ function EditorComponent(
   }, []);
 
   const handleGetMarkdown = useCallback((): string => {
-    if (!ctxRef.current) return "";
-    return ctxRef.current.call(getMarkdown());
-  }, []);
+    if (loading) return "";
+    const editor = getInstance();
+    if (!editor) return "";
+    try {
+      return editor.action(getMarkdown());
+    } catch {
+      return "";
+    }
+  }, [loading, getInstance]);
 
   const handleIsDirty = useCallback((): boolean => {
     return isDirty;
@@ -103,10 +142,6 @@ function EditorComponent(
     markClean: handleMarkClean,
   }));
 
-  if (loading) {
-    return <div className="editor-loading">Loading editor...</div>;
-  }
-
   return (
     <div className={`editor-container ${readonly ? "readonly" : ""}`}>
       <Milkdown />
@@ -116,8 +151,9 @@ function EditorComponent(
 
 export const Editor = forwardRef(EditorComponent);
 
-// Convenience wrapper with provider
-export function EditorWithProvider(props: EditorProps & { ref?: React.Ref<EditorHandle> }) {
+export function EditorWithProvider(
+  props: EditorProps & { ref?: React.Ref<EditorHandle> },
+) {
   return (
     <MilkdownProvider>
       <Editor {...props} ref={props.ref} />

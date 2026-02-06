@@ -170,3 +170,37 @@
   margin-right: 0.5em;
   margin-left: -1.5em;
 }
+
+/* Collaboration cursor styles */
+.yRemoteSelection {
+  background-color: var(--user-color-light, rgba(48, 188, 237, 0.2));
+  border-left: none;
+  border-right: none;
+  margin-right: -1px;
+}
+
+.yRemoteSelectionHead {
+  position: absolute;
+  border-left: 2px solid var(--user-color, #30bced);
+  border-top: none;
+  border-bottom: none;
+  height: 100%;
+  box-sizing: border-box;
+}
+
+.yRemoteSelectionHead::after {
+  content: attr(data-user-name);
+  position: absolute;
+  top: -1.4em;
+  left: -2px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  border-radius: 3px 3px 3px 0;
+  background-color: var(--user-color, #30bced);
+  color: #fff;
+  pointer-events: none;
+  opacity: 0.9;
+}

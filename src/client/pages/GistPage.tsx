@@ -1,71 +1,72 @@
-import { useRef, useState } from "react";
+import { useRef, useState, useCallback } from "react";
 import { useParams } from "react-router-dom";
-import { Editor, EditorHandle } from "../components/Editor";
+import { Editor } from "../components/Editor";
+import type { EditorHandle } from "../components/Editor";
 import { MilkdownProvider } from "@milkdown/react";
+import { useCollabProvider } from "../hooks/useCollabProvider";
+import { useMarkdownProtocol } from "../hooks/useMarkdownProtocol";
+import { useAuth } from "../contexts/AuthContext";
 import "./gist-page.css";
 
 export function GistPage() {
   const { gistId } = useParams<{ gistId: string }>();
   const editorRef = useRef<EditorHandle>(null);
   const [exportedMarkdown, setExportedMarkdown] = useState("");
+  const [defaultValue, setDefaultValue] = useState<string | undefined>(undefined);
+  const { user } = useAuth();
 
-  // Placeholder markdown for testing
-  const defaultMarkdown = `# Welcome to gist.party
+  const { doc, provider, awareness, connectionState } = useCollabProvider({ gistId, user });
 
-This is a **collaborative** markdown editor powered by Milkdown and Yjs.
+  const getMarkdown = useCallback(
+    () => editorRef.current?.getMarkdown() ?? "",
+    [],
+  );
 
-## Features
+  const handleNeedsInit = useCallback(
+    async (initGistId: string, _filename: string) => {
+      try {
+        const res = await fetch(`/api/gists/${initGistId}`);
+        if (!res.ok) return;
+        const data = await res.json() as { content?: string };
+        if (data.content) {
+          setDefaultValue(data.content);
+        }
+      } catch {
+        // failed to fetch initial content
+      }
+    },
+    [],
+  );
 
-- WYSIWYG editing
-- Real-time collaboration (coming soon)
-- GitHub Gist integration (coming soon)
+  const handleReloadRemote = useCallback((markdown: string) => {
+    setDefaultValue(markdown);
+  }, []);
 
-## Try it out
-
-Type "/" for slash commands or use Markdown syntax:
-
-### Heading 3
-
-**Bold text** and *italic text*
-
-- List item 1
-- List item 2
-  - Nested item
-
-- [ ] Task 1
-- [x] Task 2 (done)
-
-| Column 1 | Column 2 |
-|----------|----------|
-| Cell 1   | Cell 2   |
-| Cell 3   | Cell 4   |
-
-\`\`\`javascript
-console.log("Hello from gist.party!");
-\`\`\`
-
-> This is a blockquote
-
----
-
-Enjoy editing!
-`;
+  useMarkdownProtocol({
+    provider,
+    getMarkdown,
+    onNeedsInit: handleNeedsInit,
+    onReloadRemote: handleReloadRemote,
+  });
 
   const handleExport = () => {
     const markdown = editorRef.current?.getMarkdown() || "";
     setExportedMarkdown(markdown);
-    console.log("Exported markdown:", markdown);
   };
 
-  const handleChange = (markdown: string) => {
-    // This will be debounced (300ms) by the Editor component
-    console.log("Content changed:", markdown.substring(0, 100) + "...");
+  const handleChange = (_markdown: string) => {
+    // debounced change handler — can be used for save triggers
   };
 
   return (
     <div className="gist-page">
       <div className="gist-header">
         <h2>Editing: {gistId}</h2>
+        <div className="gist-header-info">
+          <span className={`connection-status ${connectionState}`}>
+            {connectionState}
+          </span>
+        </div>
         <div className="gist-actions">
           <button type="button" className="btn btn-secondary" onClick={handleExport}>
             Export Markdown
@@ -74,13 +75,19 @@ Enjoy editing!
       </div>
 
       <div className="editor-wrapper">
-        <MilkdownProvider>
-          <Editor
-            ref={editorRef}
-            defaultValue={defaultMarkdown}
-            onChange={handleChange}
-          />
-        </MilkdownProvider>
+        {doc ? (
+          <MilkdownProvider>
+            <Editor
+              ref={editorRef}
+              doc={doc}
+              awareness={awareness}
+              defaultValue={defaultValue}
+              onChange={handleChange}
+            />
+          </MilkdownProvider>
+        ) : (
+          <div className="editor-loading">Connecting...</div>
+        )}
       </div>
 
       {exportedMarkdown && (
