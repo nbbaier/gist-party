@@ -3,6 +3,7 @@ import { YServer } from "y-partyserver";
 import * as Y from "yjs";
 import { decrypt } from "../src/shared/encryption";
 import { verifyEditCookie } from "../src/shared/edit-cookie";
+import { verifyJwt } from "./shared/jwt";
 import {
 	type CanonicalMarkdownPayload,
 	type CustomMessage,
@@ -55,7 +56,10 @@ export class GistRoom extends YServer<WorkerEnv> {
 	private pendingMarkdownRequests = new Map<string, PendingMarkdownRequest>();
 	private needsInit = false;
 	private messageCounts = new Map<string, number[]>();
-	private connectionCapabilities = new Map<string, { canEdit: boolean }>();
+	private connectionCapabilities = new Map<
+		string,
+		{ canEdit: boolean; isOwner: boolean }
+	>();
 
 	private ownerToken: string | null = null;
 	private syncState: SyncState = "saved";
@@ -146,8 +150,11 @@ export class GistRoom extends YServer<WorkerEnv> {
 
 		this.messageCounts.set(connection.id, []);
 
-		const canEdit = await this.checkEditCapability(ctx);
-		this.connectionCapabilities.set(connection.id, { canEdit });
+		const [canEdit, isOwner] = await Promise.all([
+			this.checkEditCapability(ctx),
+			this.checkOwner(ctx),
+		]);
+		this.connectionCapabilities.set(connection.id, { canEdit, isOwner });
 
 		if (this.needsInit) {
 			const gistId = this.getMeta("gistId");
@@ -247,11 +254,11 @@ export class GistRoom extends YServer<WorkerEnv> {
 					break;
 
 				case MessageTypePushLocal:
-					this.handlePushLocal();
+					this.handlePushLocal(connection);
 					break;
 
 				case MessageTypeDiscardLocal:
-					this.handleDiscardLocal();
+					this.handleDiscardLocal(connection);
 					break;
 
 				default:
@@ -370,7 +377,10 @@ export class GistRoom extends YServer<WorkerEnv> {
 	// GitHub Sync
 	// ============================================================================
 
-	private async syncToGitHub(markdown: string): Promise<void> {
+	private async syncToGitHub(
+		markdown: string,
+		options?: { force?: boolean },
+	): Promise<void> {
 		const gistId = this.getMeta("gistId");
 		const filename = this.getMeta("filename");
 		const storedEtag = this.getMeta("etag");
@@ -385,7 +395,7 @@ export class GistRoom extends YServer<WorkerEnv> {
 			"User-Agent": "gist-party",
 			"Content-Type": "application/json",
 		};
-		if (storedEtag) {
+		if (storedEtag && !options?.force) {
 			headers["If-Match"] = storedEtag;
 		}
 
@@ -588,11 +598,9 @@ export class GistRoom extends YServer<WorkerEnv> {
 		}
 	}
 
-	private isOwnerConnection(_connection: Connection): boolean {
-		// TODO: Check connection state for userId match against ownerUserId
-		// For now, treat all connections as potential owner connections
-		// This will be refined when auth is fully wired (Track 1A/3B)
-		return true;
+	private isOwnerConnection(connection: Connection): boolean {
+		const cap = this.connectionCapabilities.get(connection.id);
+		return cap?.isOwner === true;
 	}
 
 	private findOwnerConnection(
@@ -688,20 +696,59 @@ export class GistRoom extends YServer<WorkerEnv> {
 	// Conflict Resolution Handlers
 	// ============================================================================
 
-	private async handlePushLocal(): Promise<void> {
+	private async handlePushLocal(connection: Connection): Promise<void> {
+		if (!this.isOwnerConnection(connection)) {
+			console.log(
+				`[GistRoom ${this.name}] Ignoring push-local from non-owner ${connection.id}`,
+			);
+			return;
+		}
+
 		this.autoSyncPaused = false;
 		this.retryAttempt = 0;
 
-		const markdown = this.loadCanonicalMarkdown();
+		const ownerConnection = this.getOwnerConnection();
+		if (!ownerConnection) {
+			console.log(
+				`[GistRoom ${this.name}] No owner connection available for push-local`,
+			);
+			return;
+		}
+
+		const markdown = await this.requestCanonicalMarkdownFromConnection(
+			ownerConnection,
+		);
 		if (markdown && this.ownerToken) {
-			this.setMeta("etag", "");
-			await this.syncToGitHub(markdown);
+			await this.syncToGitHub(markdown, { force: true });
 		}
 	}
 
-	private handleDiscardLocal(): void {
+	private async handleDiscardLocal(connection: Connection): Promise<void> {
+		if (!this.isOwnerConnection(connection)) {
+			console.log(
+				`[GistRoom ${this.name}] Ignoring discard-local from non-owner ${connection.id}`,
+			);
+			return;
+		}
+
 		this.autoSyncPaused = false;
 		this.retryAttempt = 0;
+
+		const remote = await this.fetchRemoteGist();
+		if (!remote) return;
+
+		const filename = this.getMeta("filename");
+		if (!filename) return;
+
+		const remoteFile = remote.files?.[filename];
+		const remoteMarkdown = remoteFile?.content ?? "";
+
+		const message: CustomMessage = {
+			type: MessageTypeReloadRemote,
+			payload: { markdown: remoteMarkdown },
+		};
+		this.broadcastCustomMessage(encodeMessage(message));
+		this.setMeta("pendingSync", "false");
 		this.broadcastSyncStatus("saved");
 	}
 
@@ -901,6 +948,13 @@ export class GistRoom extends YServer<WorkerEnv> {
 		return null;
 	}
 
+	private getOwnerConnection(): Connection | null {
+		for (const connection of this.getConnections()) {
+			if (this.isOwnerConnection(connection)) return connection;
+		}
+		return null;
+	}
+
 	// ============================================================================
 	// Edit Capability
 	// ============================================================================
@@ -921,6 +975,56 @@ export class GistRoom extends YServer<WorkerEnv> {
 			this.env.JWT_SECRET,
 		);
 		return payload !== null;
+	}
+
+	private async checkOwner(ctx: ConnectionContext): Promise<boolean> {
+		const cookieHeader = ctx.request.headers.get("cookie");
+		if (!cookieHeader) return false;
+
+		const sessionMatch = cookieHeader.match(/__session=([^;]+)/);
+		if (!sessionMatch) return false;
+
+		const ownerUserId = this.getMeta("ownerUserId");
+		if (!ownerUserId) return false;
+
+		try {
+			const claims = await verifyJwt(sessionMatch[1], {
+				secret: this.env.JWT_SECRET,
+				expiresInSeconds: 3600,
+				audience: "gist.party",
+				issuer: "gist.party",
+			});
+			return claims.userId === ownerUserId;
+		} catch {
+			return false;
+		}
+	}
+
+	private async requestCanonicalMarkdownFromConnection(
+		connection: Connection,
+	): Promise<string | null> {
+		const requestId = crypto.randomUUID();
+		const message: CustomMessage = {
+			type: MessageTypeRequestMarkdown,
+			payload: { requestId },
+		};
+
+		this.sendCustomMessage(connection, encodeMessage(message));
+		console.log(
+			`[GistRoom ${this.name}] Requested markdown from ${connection.id} (requestId: ${requestId})`,
+		);
+
+		return new Promise<string | null>((resolve) => {
+			const timeout = setTimeout(() => {
+				console.log(
+					`[GistRoom ${this.name}] Markdown request timeout (requestId: ${requestId})`,
+				);
+				this.pendingMarkdownRequests.delete(requestId);
+				resolve(null);
+			}, 5000);
+
+			this.pendingMarkdownRequests.set(requestId, { resolve, timeout });
+		});
 	}
 }
 
