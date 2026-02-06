@@ -1,0 +1,26 @@
+name = "gist-party"
+main = "./worker/index.ts"
+compatibility_date = "2025-01-01"
+
+[assets]
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/parties/*"]
+
+[durable_objects]
+bindings = [
+  { name = "GIST_ROOM", class_name = "GistRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["GistRoom"]
+
+[[kv_namespaces]]
+binding = "SESSION_KV"
+id = "placeholder-kv-id"
+
+# Secrets (set via `wrangler secret put <NAME>`):
+# GITHUB_CLIENT_ID
+# GITHUB_CLIENT_SECRET
+# JWT_SECRET
+# ENCRYPTION_KEY
