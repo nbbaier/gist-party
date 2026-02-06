@@ -24,7 +24,7 @@ A web app at `gist.party` that provides real-time collaborative markdown editing
 3. Clicks "New Document"
 4. A GitHub Gist is created immediately via the API (single POST, empty content)
 5. URL updates to `gist.party/<gist_id>` and the editor opens
-6. PartyKit room is created with the gist_id as the room name
+6. GistRoom Durable Object is created with the gist_id as the room name
 
 ### Importing an Existing Gist
 
@@ -50,92 +50,119 @@ A web app at `gist.party` that provides real-time collaborative markdown editing
 ## Architecture
 
 ```bash
-┌─────────────┐       WebSocket         ┌──────────────────┐
-│   Browser    │◄─────────────────────► │   PartyKit Room  │
-│              │   (y-partykit/provider)│   (per Gist ID)  │
-│  CodeMirror  │                        │                  │
-│  + Yjs doc   │                        │  Yjs CRDT state  │
-│  + Awareness │                        │  + persistence   │
-└─────────────┘                         └────────┬─────────┘
-                                                 │
-                                          load() │ callback()
-                                                 │
-                                        ┌────────▼─────────┐
-                                        │  GitHub Gist API │
-                                        │  (source of truth)│
-                                        └──────────────────┘
+┌─────────────────┐      WebSocket       ┌───────────────────────┐
+│   Browser        │◄──────────────────► │  GistRoom DO          │
+│                  │  (y-partyserver)    │  (extends YServer)    │
+│  CodeMirror      │                     │                       │
+│  + Yjs doc       │                     │  Yjs CRDT sync/aware  │
+│  + YProvider     │                     │  + DO SQLite storage  │
+│  + Awareness     │                     │  + onLoad / onSave    │
+└─────────────────┘                      └──────────┬────────────┘
+       │                                            │
+       │ HTTP                                fetch/patch
+       ▼                                            │
+┌─────────────────┐                        ┌────────▼─────────┐
+│ Cloudflare      │                        │  GitHub Gist API │
+│ Worker (Hono)   │                        │  (source of truth)│
+│                 │                        └──────────────────┘
+│ OAuth, API,     │
+│ SPA serving     │
+│ routePartykitRequest → DO │
+└─────────────────┘
 ```
 
-### PartyKit Server (per room / per Gist)
+### GistRoom (extends YServer from y-partyserver)
 
-Each Gist ID maps to a PartyKit room. The server:
+Each Gist ID maps to a PartyServer Durable Object. The `GistRoom` class extends `YServer` (from `y-partyserver`), which provides the Yjs sync protocol, awareness, broadcasting, and persistence callbacks out of the box.
 
-- **On first connection (`load`)**: Fetches the Gist content from the GitHub API and hydrates the Yjs document
-- **On edits (`callback.handler`)**: Debounces and writes the current document state back to the Gist via the API (every ~30 seconds, or ~5 seconds after last keystroke if idle). Also flushes on last client disconnect.
-- **Persistence**: Uses `persist: { mode: "snapshot" }` so the Yjs state survives between sessions without hitting GitHub on every reconnect
-- **Staleness detection**: Before each PATCH, the server checks the Gist's `updated_at` timestamp (or ETag) against the last known value. If the Gist was modified externally, autosync pauses and a "Remote changed" warning is surfaced to connected clients. The owner can then choose to merge or overwrite.
-- **Conflict resolution on load**: If the Gist was edited externally (e.g., via `gh` CLI) and no room is active, the next `load()` merges the external changes into the CRDT
+The GistRoom:
+
+- **`onLoad()`**: Called once when the DO starts or wakes from hibernation. Loads the Yjs snapshot from DO SQLite storage. If no snapshot exists, fetches the Gist content from the GitHub API and applies it to `this.document` (the Yjs `Y.Doc` provided by `YServer`).
+- **`onSave()`**: Called by `YServer` after edits (debounced via `callbackOptions`). Writes the Yjs snapshot to DO SQLite storage. If the owner is connected, also PATCHes the Gist via the GitHub API (with staleness check). If the owner is not connected, marks the document as "pending sync".
+- **`isReadOnly(connection)`**: Returns `true` for connections without a valid edit token — `YServer` silently drops incoming Yjs updates from read-only connections.
+- **`onCustomMessage(connection, message)`**: Handles non-Yjs messages over the same WebSocket (sync status, staleness warnings, merge/overwrite decisions).
+- **Hibernation**: Enabled via `static options = { hibernate: true }`. The DO is evicted from memory when idle; `onLoad()` rehydrates state from storage on wake. Supports up to 32k concurrent connections.
+- **Staleness detection**: Before each GitHub PATCH in `onSave()`, checks the Gist's `updated_at` / ETag against the stored value. If stale (external edit detected), autosync pauses and a "Remote changed" custom message is sent to connected clients.
+- **Conflict resolution on load**: If the stored snapshot is older than 5 minutes, `onLoad()` validates against GitHub. If stale, the external markdown content is applied to the Yjs doc (overwrite with warning for MVP; diff-based merge deferred to post-MVP).
+- **Owner token handling**: The owner's GitHub access token is held **in memory only**, associated with the owner's active WebSocket connection. If the owner disconnects, the token is dropped and `pendingSync` is set; saves resume when the owner reconnects.
+- **Persistence**: Uses DO SQLite storage (`this.ctx.storage.sql`) for the Yjs snapshot and metadata (`gistId`, `filename`, `etag`/`updatedAt`, `editTokenHash`, `lastSavedAt`, `pendingSync`).
+
+### Cloudflare Worker (Hono + routePartykitRequest)
+
+The Worker handles all HTTP traffic. WebSocket upgrades are routed to the GistRoom DO automatically via `routePartykitRequest()` from `partyserver`.
+
+- **Static assets**: Serves the Vite-built SPA (via Cloudflare Worker Assets)
+- **OAuth**: Handles the GitHub OAuth flow (`/api/auth/github`, `/api/auth/github/callback`), issues signed JWT session cookies
+- **API routes**: Gist CRUD, edit token management
+- **WebSocket routing**: `routePartykitRequest(request, env)` handles the `/parties/gist-room/:gist_id` path automatically, forwarding WebSocket upgrades to the correct DO instance
+- **Session verification**: Issues and verifies signed JWT cookies containing `{ userId, login, avatarUrl }` — verifiable by both the Worker and the DO without network hops
 
 ### Client
 
 - **Editor**: CodeMirror 6 with `y-codemirror.next` binding for Yjs integration
-- **Provider**: `y-partykit/provider` connecting to the room named after the Gist ID
-- **Awareness**: Shows collaborator cursors, selections, and names (pulled from GitHub profile)
+- **Provider**: `YProvider` from `y-partyserver/provider` connecting to the GistRoom DO. Configured with `party: "gist-room"` and `room: gistId`.
+- **Awareness**: Shows collaborator cursors, selections, and names (pulled from GitHub profile via JWT)
+- **Custom messages**: Uses `provider.sendMessage()` and `provider.on("custom-message", ...)` for non-Yjs communication (sync status, staleness warnings)
 - **Markdown preview**: Optional split-pane rendered preview using `markdown-it` or similar
 
 ## Tech Stack
 
-| Component        | Technology                          |
-| ---------------- | ----------------------------------- |
-| Framework        | Vite + React                        |
-| Editor           | CodeMirror 6                        |
-| CRDT             | Yjs + y-codemirror.next             |
-| Realtime server  | PartyKit (y-partykit)               |
-| Auth             | GitHub OAuth 2.0                    |
-| Storage          | GitHub Gists API                    |
-| Session cache    | PartyKit room storage (snapshots)   |
-| Markdown render  | markdown-it (for read-only view)    |
-| Deployment       | PartyKit (server) + Vercel (client) |
+| Component         | Technology                                     |
+| ----------------- | ---------------------------------------------- |
+| Framework         | Vite + React                                   |
+| Editor            | CodeMirror 6                                   |
+| CRDT              | Yjs + y-codemirror.next                        |
+| Realtime server   | PartyServer (`partyserver`) on Cloudflare DOs  |
+| Yjs integration   | `y-partyserver` (YServer + YProvider)          |
+| HTTP router       | Hono                                           |
+| Auth              | GitHub OAuth 2.0 (PKCE + state)                |
+| Session           | Signed JWT cookies (verified in Worker + DO)   |
+| Session store     | Workers KV                                     |
+| Storage           | GitHub Gists API                               |
+| DO persistence    | Durable Object SQLite storage (snapshots)      |
+| Markdown render   | markdown-it (for read-only view)               |
+| Deployment        | Cloudflare Workers + Durable Objects           |
 
 ## API Routes
 
-These are handled by the PartyKit server or a lightweight API layer:
+These are handled by the Cloudflare Worker (Hono router). WebSocket routing is handled by `routePartykitRequest()`.
 
-| Route                        | Method | Description                                |
-| ---------------------------- | ------ | ------------------------------------------ |
-| `/api/auth/github`           | GET    | Initiates GitHub OAuth flow                |
-| `/api/auth/github/callback`  | GET    | OAuth callback, sets session               |
-| `/api/gists`                 | POST   | Creates a new Gist, returns `{ gist_id, edit_token }` |
-| `/api/gists/:id`             | GET    | Returns Gist metadata                      |
-| `/api/gists/:id/edit-token`  | POST   | Revokes current edit token, generates a new one (owner only) |
-| `/:gist_id`                  | GET    | Serves editor (if valid edit token) or viewer |
-| `/:gist_id/raw`              | GET    | Returns raw markdown as `text/plain`       |
+| Route                              | Method | Description                                |
+| ---------------------------------- | ------ | ------------------------------------------ |
+| `/api/auth/github`                 | GET    | Initiates GitHub OAuth flow                |
+| `/api/auth/github/callback`        | GET    | OAuth callback, sets session               |
+| `/api/gists`                       | POST   | Creates a new Gist, returns `{ gist_id, edit_token }` |
+| `/api/gists/:id`                   | GET    | Returns Gist metadata                      |
+| `/api/gists/:id/edit-token`        | POST   | Revokes current edit token, generates a new one (owner only) |
+| `/parties/gist-room/:gist_id`      | GET    | WebSocket upgrade (handled by `routePartykitRequest`) |
+| `/:gist_id`                        | GET    | Serves editor (if valid edit token) or viewer |
+| `/:gist_id/raw`                    | GET    | Returns raw markdown as `text/plain`       |
 
 ## Data Flow: Edit → Save
 
 1. User types in CodeMirror
 2. `y-codemirror.next` applies the edit to the local Yjs document
-3. Yjs syncs the update to the PartyKit room via WebSocket
-4. PartyKit broadcasts the update to all other connected clients
-5. PartyKit's `callback.handler` fires after debounce (30s, or 5s after last keystroke if idle)
-6. If the owner is not connected: the room marks the snapshot as "pending sync" (flushed when the owner reconnects). Skip to step 10.
-7. Server checks the Gist's `updated_at` against the last known value
-8. If stale (external edit detected): autosync pauses, clients are notified with a "Remote changed" warning. Owner chooses to merge or overwrite.
-9. If not stale: handler calls `PATCH /gists/:id` on the GitHub API with the full document content, stores the new `updated_at`
-10. PartyKit room storage is updated with the latest snapshot
+3. `YProvider` syncs the update to the GistRoom DO via WebSocket
+4. `YServer` broadcasts the update to all other connected clients automatically
+5. `YServer` calls `onSave()` after the debounce period (configured via `callbackOptions`)
+6. `onSave()` writes the snapshot to DO SQLite storage
+7. If the owner is not connected: `onSave()` sets `pendingSync = true` (flushed when the owner reconnects). Done.
+8. If the owner is connected: `onSave()` checks the Gist's `updated_at` against the last known value
+9. If stale (external edit detected): autosync pauses, clients are notified with a "Remote changed" custom message. Owner chooses to merge or overwrite.
+10. If not stale: `onSave()` calls `PATCH /gists/:id` on the GitHub API with the full document content, stores the new `updated_at`
 
 ## Data Flow: Load
 
-1. Client connects to PartyKit room for Gist ID `abc123`
-2. If room has persisted snapshot → load from PartyKit storage (fast)
-3. If no snapshot → `load()` fetches from GitHub Gist API, returns Yjs doc
-4. Client receives the Yjs state and renders in CodeMirror
+1. Client creates a `YProvider` with `party: "gist-room"` and `room: gistId`; `routePartykitRequest` routes the WebSocket to the GistRoom DO
+2. `YServer` calls `onLoad()` — if DO SQLite has a snapshot, apply it to `this.document`
+3. If no snapshot → `onLoad()` fetches from GitHub Gist API, applies content to `this.document`
+4. `YServer` runs the Yjs sync handshake with the client automatically; client receives the Yjs state and renders in CodeMirror
 
 ## Auth Model
 
 - **GitHub OAuth** with `gist` scope (read/write Gists), using PKCE + `state` parameter
 - Access token stored server-side only (HTTP-only cookie references the session; token never sent to the client or stored in localStorage)
-- **GitHub sync requires the owner to be connected**: the PartyKit server uses the owner's token (provided via their active WebSocket connection) to write back to the Gist. If the owner disconnects, edits accumulate in the PartyKit snapshot as "pending sync" and flush when the owner reconnects.
+- **GitHub sync requires the owner to be connected**: the Durable Object uses the owner's token (provided via their active WebSocket connection) to write back to the Gist. If the owner disconnects, edits accumulate in DO storage as "pending sync" and flush when the owner reconnects.
 - Collaborators authenticate to get cursor identity but do not need `gist` scope — only the owner's token is used for GitHub writes
 
 ## Edit Permissions
@@ -143,9 +170,9 @@ These are handled by the PartyKit server or a lightweight API layer:
 Edit access is controlled via **capability-based edit tokens**, not by authentication alone.
 
 - When a Gist owner creates or imports a document, the server generates a random edit token (cryptographically random, URL-safe, 32+ chars)
-- The token hash (SHA-256) is stored in PartyKit room storage alongside the Gist metadata
+- The token hash (SHA-256) is stored in Durable Object storage alongside the Gist metadata
 - The owner receives the edit link: `gist.party/<gist_id>?edit=<token>`
-- **Server-side enforcement**: the PartyKit room validates the edit token on WebSocket connection. Connections without a valid token are admitted as **read-only** — incoming Yjs updates from those connections are silently dropped.
+- **Server-side enforcement**: the Durable Object validates the edit token on WebSocket connection. Connections without a valid token are admitted as **read-only** — incoming Yjs updates from those connections are silently dropped.
 - The owner can revoke an edit token and generate a new one at any time
 
 | User                          | Can view | Can edit (CRDT) | Changes saved to Gist |
@@ -207,5 +234,5 @@ Edit access is controlled via **capability-based edit tokens**, not by authentic
 1. ~~**Rate limits**: GitHub API allows 5,000 requests/hour per authenticated user. With 5s debounce saves, a single active editor generates ~720 writes/hour. Should we increase the debounce window or batch?~~ **Resolved**: 30s debounce + idle-save + flush-on-disconnect keeps writes under ~120/hour per active doc.
 2. **Multi-file Gists**: GitHub Gists can contain multiple files. MVP targets single-file Gists. How should multi-file Gists be handled later?
 3. **Gist visibility**: Should new Gists be created as public or secret? Configurable per-document?
-4. ~~**Stale sessions**: If a PartyKit room has a persisted snapshot but the Gist was edited externally, how aggressively should we check for staleness?~~ **Resolved**: Check `updated_at` / ETag before every PATCH. On `load()`, always validate the snapshot against GitHub if it's older than 5 minutes. If stale, merge external changes into the CRDT before serving.
-5. **Deployment topology**: Deploy client and server together on PartyKit (it can serve static assets), or split across PartyKit + Vercel?
+4. ~~**Stale sessions**: If a GistRoom DO has a persisted snapshot but the Gist was edited externally, how aggressively should we check for staleness?~~ **Resolved**: Check `updated_at` / ETag before every PATCH. In `onLoad()`, always validate the snapshot against GitHub if it's older than 5 minutes. If stale, merge external changes into the CRDT before serving.
+5. ~~**Deployment topology**: Deploy client and server together on PartyKit (it can serve static assets), or split across PartyKit + Vercel?~~ **Resolved**: Single Cloudflare deployment — Worker serves the SPA and API, Durable Objects handle real-time collaboration.
