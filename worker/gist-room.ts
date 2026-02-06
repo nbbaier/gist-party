@@ -31,9 +31,16 @@ export class GistRoom extends YServer {
     debounceMaxWait: 60000, // Max 60 seconds
   };
 
+  // Connection and rate limits
+  static MAX_CONNECTIONS = 50; // Max concurrent connections per room
+  static MAX_MESSAGE_SIZE = 2 * 1024 * 1024; // 2MB max message size
+  static MESSAGE_RATE_WINDOW = 60000; // 1 minute window
+  static MAX_MESSAGES_PER_WINDOW = 100; // Max messages per connection per minute
+
   // In-memory state (cleared on hibernation)
   private pendingMarkdownRequests = new Map<string, PendingMarkdownRequest>();
   private needsInit = false;
+  private messageCounts = new Map<string, number[]>(); // connectionId -> timestamps
 
   // ============================================================================
   // Lifecycle Methods
@@ -54,6 +61,7 @@ export class GistRoom extends YServer {
 
     // Clear any stale in-memory state from previous hibernation
     this.pendingMarkdownRequests.clear();
+    this.messageCounts.clear();
     this.needsInit = false;
 
     // Ensure database schema exists
@@ -93,7 +101,15 @@ export class GistRoom extends YServer {
    * Called when a new WebSocket connection is established
    */
   async onConnect(connection: Connection, _ctx: ConnectionContext): Promise<void> {
-    console.log(`[GistRoom ${this.name}] Connection ${connection.id} joined`);
+    // Enforce connection count limit
+    const currentConnections = Array.from(this.getConnections()).length;
+    if (currentConnections >= GistRoom.MAX_CONNECTIONS) {
+      console.log(`[GistRoom ${this.name}] Rejecting connection - max connections (${GistRoom.MAX_CONNECTIONS}) reached`);
+      connection.close(4005, "Room is at capacity");
+      return;
+    }
+
+    console.log(`[GistRoom ${this.name}] Connection ${connection.id} joined (${currentConnections + 1}/${GistRoom.MAX_CONNECTIONS})`);
 
     // Check if room is initialized
     const initialized = this.getMeta("initialized");
@@ -106,6 +122,9 @@ export class GistRoom extends YServer {
     // TODO: Verify JWT session cookie (stub until Track 1A delivers)
     // const user = await verifyJWT(cookie, secret);
     // connection.setState({ user });
+
+    // Initialize message tracking for this connection
+    this.messageCounts.set(connection.id, []);
 
     // If room needs init content, send needs-init to first client
     if (this.needsInit) {
@@ -136,6 +155,47 @@ export class GistRoom extends YServer {
     console.log(
       `[GistRoom ${this.name}] Connection ${connection.id} left (code: ${code}, reason: ${reason})`
     );
+    
+    // Clean up message tracking for this connection
+    this.messageCounts.delete(connection.id);
+  }
+
+  /**
+   * Called when a message is received from a connection
+   * Enforces message size and rate limits
+   */
+  async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
+    // Check message size (convert to bytes for size check)
+    const messageBytes = typeof message === 'string' 
+      ? new TextEncoder().encode(message).length 
+      : message.byteLength;
+    
+    if (messageBytes > GistRoom.MAX_MESSAGE_SIZE) {
+      console.log(`[GistRoom ${this.name}] Message from ${connection.id} exceeds size limit (${messageBytes} > ${GistRoom.MAX_MESSAGE_SIZE})`);
+      connection.close(4009, "Message too large");
+      return;
+    }
+
+    // Check rate limit
+    const now = Date.now();
+    const timestamps = this.messageCounts.get(connection.id) || [];
+    
+    // Remove timestamps outside the window
+    const windowStart = now - GistRoom.MESSAGE_RATE_WINDOW;
+    const recentTimestamps = timestamps.filter(ts => ts > windowStart);
+    
+    if (recentTimestamps.length >= GistRoom.MAX_MESSAGES_PER_WINDOW) {
+      console.log(`[GistRoom ${this.name}] Rate limit exceeded for ${connection.id}`);
+      connection.close(4008, "Rate limit exceeded");
+      return;
+    }
+    
+    // Record this message
+    recentTimestamps.push(now);
+    this.messageCounts.set(connection.id, recentTimestamps);
+
+    // Process the message via parent class (handles Yjs updates)
+    await super.onMessage(connection, message);
   }
 
   /**
