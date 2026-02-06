@@ -1,5 +1,9 @@
 import { Hono } from "hono";
 import { routePartykitRequest } from "partyserver";
+
+// biome-ignore lint/performance/noBarrelFile: we need to re-export the GistRoom class
+export { GistRoom } from "./gist-room";
+
 import authRoutes from "./routes/auth";
 import gistRoutes from "./routes/gists";
 import { csrfMiddleware } from "./shared/csrf";
